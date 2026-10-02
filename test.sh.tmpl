@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Automated test run for RemoteOps (reg @@REGNO@@). Run from the repo root:  ./test.sh
+# Output is also saved to test_output.txt - screenshot YOUR OWN run for the report.
+PORT=@@PORT@@; REG=@@REGNO@@; L3=@@L3@@; SID=@@SID@@
+PASS=0; FAIL=0
+check() { # name, pattern, text
+  if grep -q -- "$2" <<<"$3"; then echo "  [PASS] $1"; PASS=$((PASS+1)); else echo "  [FAIL] $1"; FAIL=$((FAIL+1)); fi
+}
+make -f Makefile_$L3 >/dev/null || { echo "build failed"; exit 1; }
+./agent_$L3 > agent_stdout.txt 2>&1 &
+AG=$!
+trap 'kill $AG 2>/dev/null' EXIT
+sleep 1
+echo "== Agent listening (ss) =="; ss -tlnp 2>/dev/null | grep ":$PORT" || echo "(ss not available)"
+head -c 300000 /dev/urandom > /tmp/ro_test.bin
+
+echo "== T1 auth + sysinfo + listproc + exec + whitelist =="
+O=$( (echo SYSINFO; echo LISTPROC; echo "EXEC DATE"; echo "EXEC WHOAMI"; echo "EXEC HOSTNAME"; echo "EXEC UPTIME"; echo "EXEC DISKFREE"; echo "EXEC rm"; echo QUIT) | ./controller_$L3 127.0.0.1 $PORT 2>&1 ); echo "$O"
+check "AUTH ok with SID"        "OK AUTHENTICATED SID:$SID" "$O"
+check "SYSINFO"                 "OK SYSINFO .* SID:$SID" "$O"
+check "LISTPROC"                "OK PROCS .* SID:$SID" "$O"
+check "EXEC DATE"               "OK EXEC_RESULT .* SID:$SID" "$O"
+check "EXEC rejected"           "ERR 002 COMMAND_NOT_ALLOWED SID:$SID" "$O"
+check "QUIT"                    "OK BYE SID:$SID" "$O"
+
+echo "== T2 bad token / command before auth =="
+O=$( (echo SYSINFO; echo "AUTH WRONG"; echo QUIT) | ./controller_$L3 127.0.0.1 $PORT noauth 2>&1 ); echo "$O"
+check "not authenticated"       "ERR 003 NOT_AUTHENTICATED SID:$SID" "$O"
+check "auth failed"             "ERR 001 AUTH_FAILED SID:$SID" "$O"
+
+echo "== T3 PUT / GET byte-for-byte =="
+O=$( (echo "PUT /tmp/ro_test.bin sample.bin"; echo "GET sample.bin /tmp/ro_back.bin"; echo "GET missing.bin"; echo "PUT /tmp/ro_test.bin ../evil"; echo SYSINFO; echo QUIT) | ./controller_$L3 127.0.0.1 $PORT 2>&1 ); echo "$O"
+check "PUT ok"                  "OK FILE_RECEIVED sample.bin SID:$SID" "$O"
+check "GET ok"                  "OK FILE_SEND sample.bin 300000 SID:$SID" "$O"
+check "GET missing"             "ERR 005 FILE_NOT_FOUND SID:$SID" "$O"
+check "bad filename rejected"   "ERR 008 BAD_FILENAME SID:$SID" "$O"
+check "stream still in sync"    "OK SYSINFO" "$O"
+if cmp -s /tmp/ro_test.bin /tmp/ro_back.bin; then echo "  [PASS] downloaded file identical"; PASS=$((PASS+1)); else echo "  [FAIL] files differ"; FAIL=$((FAIL+1)); fi
+ls -l ./agentfiles/$REG/
+
+echo "== T4 oversize upload =="
+head -c 11000000 /dev/zero > /tmp/ro_big.bin
+O=$( (echo "PUT /tmp/ro_big.bin big.bin"; echo SYSINFO; echo QUIT) | ./controller_$L3 127.0.0.1 $PORT 2>&1 ); echo "$O" | grep -v throughput
+check "too large"               "ERR 004 FILE_TOO_LARGE SID:$SID" "$O"
+check "in sync after rejection" "OK SYSINFO" "$O"
+
+echo "== T5 UDP monitoring (5 s) =="
+O=$( (echo "MONITOR START 9555"; sleep 5; echo "MONITOR STOP"; echo QUIT) | ./controller_$L3 127.0.0.1 $PORT 2>&1 ); echo "$O"
+check "monitor started"         "OK MONITOR_STARTED SID:$SID" "$O"
+check "UDP datagram with SID"   "\[UDP\] SYSINFO .* SID:$SID" "$O"
+check "monitor stopped"         "OK MONITOR_STOPPED SID:$SID" "$O"
+
+echo "== T6 six simultaneous controllers =="
+for i in 1 2 3 4 5 6; do ( (echo SYSINFO; sleep 2; echo "EXEC HOSTNAME"; echo QUIT) | ./controller_$L3 127.0.0.1 $PORT > /tmp/ro_c$i.txt 2>&1 ) & done
+wait $(jobs -p | grep -v $AG) 2>/dev/null; sleep 3
+OK=0; for i in 1 2 3 4 5 6; do grep -q "OK EXEC_RESULT" /tmp/ro_c$i.txt && OK=$((OK+1)); done
+[ $OK -eq 6 ] && { echo "  [PASS] 6/6 concurrent sessions served"; PASS=$((PASS+1)); } || { echo "  [FAIL] only $OK/6"; FAIL=$((FAIL+1)); }
+
+echo "== T7 abrupt disconnect mid-upload, agent must survive =="
+( echo "AUTH @@TOKEN@@"; echo "PUT partial.bin 100000"; head -c 1000 /dev/zero ) | timeout 2 nc 127.0.0.1 $PORT >/dev/null 2>&1
+sleep 1
+O=$( (echo SYSINFO; echo QUIT) | ./controller_$L3 127.0.0.1 $PORT 2>&1 )
+check "agent alive after abort" "OK SYSINFO" "$O"
+[ ! -e ./agentfiles/$REG/partial.bin ] && { echo "  [PASS] no partial file left"; PASS=$((PASS+1)); } || { echo "  [FAIL] partial file exists"; FAIL=$((FAIL+1)); }
+
+echo "== Log excerpt =="; tail -n 15 remoteops_$REG.log
+echo; echo "RESULT: $PASS passed, $FAIL failed"

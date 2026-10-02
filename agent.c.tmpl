@@ -1,0 +1,506 @@
+/*
+ * RemoteOps Agent (server) - IE3090 Network Programming
+ * Registration number : @@REGNO@@
+ * Port @@PORT@@ | SID @@SID@@ | Token @@TOKEN@@ | Log @@LOGFILE@@
+ *
+ * Concurrency model: one detached POSIX thread per TCP connection.
+ * Each session has its own receive buffer (line framing), its own auth
+ * state and (optionally) its own UDP monitoring thread.
+ */
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
+/* ---- personalised values (derived from registration number) ---- */
+#define REGNO     "@@REGNO@@"
+#define PORT      @@PORT@@
+#define SID       "@@SID@@"
+#define TOKEN     "@@TOKEN@@"
+#define LOGFILE   "@@LOGFILE@@"
+#define STORE_DIR "./agentfiles/@@REGNO@@"
+
+/* ---- tunables ---- */
+#define BUF_SZ              4096
+#define LINE_MAX_LEN        1024
+#define MAX_FILE_SIZE       (10LL * 1024 * 1024)   /* 10 MB -> ERR 004 */
+#define DRAIN_LIMIT         (64LL * 1024 * 1024)   /* above this: close instead of draining */
+#define MAX_AUTH_FAILS      3
+#define MONITOR_INTERVAL_SEC 2
+
+typedef struct {
+    int fd;
+    struct sockaddr_in peer;
+    char peer_str[64];
+    int authed;
+    int auth_fails;
+    char buf[BUF_SZ];          /* receive buffer: may hold partial/multiple lines */
+    size_t len;
+    int mon_running;
+    atomic_int mon_stop;
+    pthread_t mon_thr;
+    struct sockaddr_in mon_dest;
+} Session;
+
+static FILE *logfp;
+static pthread_mutex_t log_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* ------------------------------------------------------------------ */
+/* Logging (thread-safe, timestamped, to file + stdout)               */
+/* ------------------------------------------------------------------ */
+static void lg(const char *fmt, ...) {
+    char ts[32];
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &tm);
+    pthread_mutex_lock(&log_mu);
+    va_list ap;
+    va_start(ap, fmt);
+    char msg[2048];
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+    fprintf(logfp, "[%s] %s\n", ts, msg);
+    fflush(logfp);
+    printf("[%s] %s\n", ts, msg);
+    fflush(stdout);
+    pthread_mutex_unlock(&log_mu);
+}
+
+/* ------------------------------------------------------------------ */
+/* Low-level I/O helpers                                              */
+/* ------------------------------------------------------------------ */
+static int send_all(int fd, const char *data, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = send(fd, data + off, n - off, MSG_NOSIGNAL);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        off += (size_t)w;
+    }
+    return 0;
+}
+
+/* Send "<body> SID:<sid>\n". Every TCP response goes through here. */
+static int reply(Session *s, const char *fmt, ...) {
+    char *body = NULL;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vasprintf(&body, fmt, ap);
+    va_end(ap);
+    if (n < 0) return -1;
+    size_t tot = (size_t)n + 16;
+    char *out = malloc(tot);
+    if (!out) { free(body); return -1; }
+    int m = snprintf(out, tot, "%s SID:%s\n", body, SID);
+    lg("[%s] RESP %.100s", s->peer_str, body);
+    int rc = send_all(s->fd, out, (size_t)m);
+    free(body);
+    free(out);
+    return rc;
+}
+
+/* Line framing: returns 1 = line read, 0 = peer closed, -1 = error, -2 = line too long.
+ * Handles partial lines (keeps accumulating) and multiple lines per recv(). */
+static int read_line(Session *s, char *line, size_t cap) {
+    for (;;) {
+        char *nl = memchr(s->buf, '\n', s->len);
+        if (nl) {
+            size_t n = (size_t)(nl - s->buf);
+            if (n >= cap) return -2;
+            memcpy(line, s->buf, n);
+            line[n] = '\0';
+            if (n > 0 && line[n - 1] == '\r') line[n - 1] = '\0';
+            size_t used = n + 1;
+            memmove(s->buf, s->buf + used, s->len - used);
+            s->len -= used;
+            return 1;
+        }
+        if (s->len >= BUF_SZ) return -2;   /* no newline in a full buffer */
+        ssize_t r = recv(s->fd, s->buf + s->len, BUF_SZ - s->len, 0);
+        if (r == 0) return 0;
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        s->len += (size_t)r;
+    }
+}
+
+/* Read up to `max` raw bytes: first drain bytes already buffered after the
+ * command line (they belong to the file body), then fall back to recv(). */
+static ssize_t read_chunk(Session *s, char *dst, size_t max) {
+    if (s->len > 0) {
+        size_t n = s->len < max ? s->len : max;
+        memcpy(dst, s->buf, n);
+        memmove(s->buf, s->buf + n, s->len - n);
+        s->len -= n;
+        return (ssize_t)n;
+    }
+    for (;;) {
+        ssize_t r = recv(s->fd, dst, max, 0);
+        if (r < 0 && errno == EINTR) continue;
+        return r;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* System information                                                 */
+/* ------------------------------------------------------------------ */
+static void get_sysinfo(char *cpu, size_t cpusz, long *mem_mb, long *uptime) {
+    snprintf(cpu, cpusz, "0.00");
+    *mem_mb = 0;
+    *uptime = 0;
+    FILE *f = fopen("/proc/loadavg", "r");
+    if (f) {
+        char tmp[32];
+        if (fscanf(f, "%31s", tmp) == 1) snprintf(cpu, cpusz, "%s", tmp);
+        fclose(f);
+    }
+    f = fopen("/proc/meminfo", "r");
+    if (f) {
+        char line[256];
+        long total = 0, avail = 0;
+        while (fgets(line, sizeof line, f)) {
+            sscanf(line, "MemTotal: %ld kB", &total);
+            sscanf(line, "MemAvailable: %ld kB", &avail);
+        }
+        fclose(f);
+        *mem_mb = (total - avail) / 1024;
+    }
+    f = fopen("/proc/uptime", "r");
+    if (f) {
+        double up = 0;
+        if (fscanf(f, "%lf", &up) == 1) *uptime = (long)up;
+        fclose(f);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* UDP monitoring thread (one per session while MONITOR START active) */
+/* ------------------------------------------------------------------ */
+static void *monitor_thread(void *arg) {
+    Session *s = arg;
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    if (u < 0) return NULL;
+    while (!atomic_load(&s->mon_stop)) {
+        char cpu[32], msg[128];
+        long mem, up;
+        get_sysinfo(cpu, sizeof cpu, &mem, &up);
+        int n = snprintf(msg, sizeof msg, "SYSINFO %s %ld %ld SID:%s", cpu, mem, up, SID);
+        sendto(u, msg, (size_t)n, 0, (struct sockaddr *)&s->mon_dest, sizeof s->mon_dest);
+        for (int i = 0; i < MONITOR_INTERVAL_SEC * 10 && !atomic_load(&s->mon_stop); i++)
+            usleep(100000);
+    }
+    close(u);
+    return NULL;
+}
+
+static void stop_monitor(Session *s) {
+    if (s->mon_running) {
+        atomic_store(&s->mon_stop, 1);
+        pthread_join(s->mon_thr, NULL);
+        s->mon_running = 0;
+        lg("[%s] UDP monitoring stopped", s->peer_str);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Command handlers                                                   */
+/* ------------------------------------------------------------------ */
+#define R(...) do { if (reply(s, __VA_ARGS__) < 0) return 0; } while (0)
+
+static int valid_filename(const char *n) {
+    size_t l = strlen(n);
+    if (l == 0 || l > 200) return 0;
+    if (strcmp(n, ".") == 0 || strcmp(n, "..") == 0) return 0;
+    for (size_t i = 0; i < l; i++) {
+        char c = n[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'))
+            return 0;
+    }
+    return 1;
+}
+
+static int do_listproc(Session *s) {
+    FILE *p = popen("ps -eo pid=,comm= 2>/dev/null", "r");
+    char out[60000];
+    size_t o = 0;
+    out[0] = '\0';
+    if (p) {
+        char line[256];
+        while (fgets(line, sizeof line, p)) {
+            int pid; char name[128];
+            if (sscanf(line, "%d %127s", &pid, name) != 2) continue;
+            int w = snprintf(out + o, sizeof out - o, "%s%d:%s", o ? "," : "", pid, name);
+            if (w < 0 || (size_t)w >= sizeof out - o) break;
+            o += (size_t)w;
+        }
+        pclose(p);
+    }
+    R("OK PROCS %s", out);
+    return 1;
+}
+
+static int do_exec(Session *s, const char *name, const char *extra) {
+    static const struct { const char *name, *cmd; } wl[] = {
+        {"DATE", "date"}, {"UPTIME", "uptime"}, {"DISKFREE", "df -h /"},
+        {"HOSTNAME", "hostname"}, {"WHOAMI", "whoami"},
+    };
+    const char *cmd = NULL;
+    if (name && !extra)
+        for (size_t i = 0; i < sizeof wl / sizeof wl[0]; i++)
+            if (strcmp(name, wl[i].name) == 0) cmd = wl[i].cmd;
+    if (!cmd) { R("ERR 002 COMMAND_NOT_ALLOWED"); return 1; }   /* fixed whitelist only */
+    char out[1024] = "";
+    FILE *p = popen(cmd, "r");
+    if (p) {
+        size_t n = fread(out, 1, sizeof out - 1, p);
+        out[n] = '\0';
+        pclose(p);
+    }
+    for (char *c = out; *c; c++) if (*c == '\n' || *c == '\r') *c = ' ';
+    size_t l = strlen(out);
+    while (l > 0 && out[l - 1] == ' ') out[--l] = '\0';
+    R("OK EXEC_RESULT %s", out);
+    return 1;
+}
+
+static int do_put(Session *s, const char *name, const char *sizestr) {
+    char *end = NULL;
+    errno = 0;
+    long long size = sizestr ? strtoll(sizestr, &end, 10) : -1;
+    if (!name || !sizestr || *end != '\0' || errno || size < 0) {
+        R("ERR 007 BAD_REQUEST");
+        return 1;
+    }
+    int name_ok = valid_filename(name);
+    int too_big = size > MAX_FILE_SIZE;
+    if (size > DRAIN_LIMIT) {            /* refuse and close: not worth draining */
+        R("ERR 004 FILE_TOO_LARGE");
+        return 0;
+    }
+    FILE *fp = NULL;
+    char path[512], tmp[560];
+    if (name_ok && !too_big) {
+        snprintf(path, sizeof path, "%s/%s", STORE_DIR, name);
+        snprintf(tmp, sizeof tmp, "%s.part%d", path, s->fd);
+        fp = fopen(tmp, "wb");
+    }
+    /* Always consume exactly <size> bytes so the stream stays in sync. */
+    long long remaining = size;
+    char chunk[8192];
+    int werr = (name_ok && !too_big && !fp);
+    while (remaining > 0) {
+        size_t want = remaining > (long long)sizeof chunk ? sizeof chunk : (size_t)remaining;
+        ssize_t g = read_chunk(s, chunk, want);
+        if (g <= 0) {                    /* client vanished mid-upload */
+            if (fp) { fclose(fp); unlink(tmp); }
+            lg("[%s] PUT %s aborted: connection lost after %lld/%lld bytes",
+               s->peer_str, name, size - remaining, size);
+            return 0;
+        }
+        if (fp && fwrite(chunk, 1, (size_t)g, fp) != (size_t)g) { werr = 1; fclose(fp); fp = NULL; }
+        remaining -= g;
+    }
+    if (!name_ok) { R("ERR 008 BAD_FILENAME"); return 1; }
+    if (too_big) { R("ERR 004 FILE_TOO_LARGE"); return 1; }
+    if (fp && fclose(fp) != 0) werr = 1;
+    if (werr || rename(tmp, path) != 0) {
+        unlink(tmp);
+        R("ERR 011 STORAGE_ERROR");
+        return 1;
+    }
+    lg("[%s] FILE TRANSFER: PUT %s (%lld bytes) stored at %s", s->peer_str, name, size, path);
+    R("OK FILE_RECEIVED %s", name);
+    return 1;
+}
+
+static int do_get(Session *s, const char *name) {
+    if (!name || !valid_filename(name)) { R("ERR 005 FILE_NOT_FOUND"); return 1; }
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s", STORE_DIR, name);
+    struct stat st;
+    FILE *fp = fopen(path, "rb");
+    if (!fp || fstat(fileno(fp), &st) != 0 || !S_ISREG(st.st_mode)) {
+        if (fp) fclose(fp);
+        R("ERR 005 FILE_NOT_FOUND");
+        return 1;
+    }
+    if (reply(s, "OK FILE_SEND %s %lld", name, (long long)st.st_size) < 0) { fclose(fp); return 0; }
+    char chunk[8192];
+    long long remaining = st.st_size;
+    while (remaining > 0) {
+        size_t want = remaining > (long long)sizeof chunk ? sizeof chunk : (size_t)remaining;
+        size_t n = fread(chunk, 1, want, fp);
+        if (n == 0) break;
+        if (send_all(s->fd, chunk, n) < 0) {
+            fclose(fp);
+            lg("[%s] GET %s aborted: send failed", s->peer_str, name);
+            return 0;
+        }
+        remaining -= (long long)n;
+    }
+    fclose(fp);
+    lg("[%s] FILE TRANSFER: GET %s (%lld bytes) sent", s->peer_str, name, (long long)st.st_size);
+    return 1;
+}
+
+static int do_monitor(Session *s, char *sub, char *portstr) {
+    if (sub && strcmp(sub, "START") == 0) {
+        char *end = NULL;
+        long port = portstr ? strtol(portstr, &end, 10) : 0;
+        if (!portstr || *end != '\0' || port < 1 || port > 65535) { R("ERR 007 BAD_REQUEST"); return 1; }
+        if (s->mon_running) { R("ERR 009 MONITOR_ALREADY_RUNNING"); return 1; }
+        s->mon_dest = s->peer;
+        s->mon_dest.sin_port = htons((uint16_t)port);
+        atomic_store(&s->mon_stop, 0);
+        if (pthread_create(&s->mon_thr, NULL, monitor_thread, s) != 0) { R("ERR 012 INTERNAL_ERROR"); return 1; }
+        s->mon_running = 1;
+        lg("[%s] UDP monitoring started -> port %ld every %ds", s->peer_str, port, MONITOR_INTERVAL_SEC);
+        R("OK MONITOR_STARTED");
+    } else if (sub && strcmp(sub, "STOP") == 0) {
+        if (!s->mon_running) { R("ERR 010 MONITOR_NOT_RUNNING"); return 1; }
+        stop_monitor(s);
+        R("OK MONITOR_STOPPED");
+    } else {
+        R("ERR 007 BAD_REQUEST");
+    }
+    return 1;
+}
+
+/* Returns 1 to keep the session open, 0 to close it. */
+static int handle_command(Session *s, char *line) {
+    char raw[LINE_MAX_LEN];
+    snprintf(raw, sizeof raw, "%s", line);
+    char *sp = NULL;
+    char *cmd = strtok_r(line, " ", &sp);
+    if (!cmd) { R("ERR 007 BAD_REQUEST"); return 1; }
+    int is_auth = strcmp(cmd, "AUTH") == 0;
+    lg("[%s] CMD %s", s->peer_str, is_auth ? "AUTH <hidden>" : raw);
+
+    if (is_auth) {
+        char *tok = strtok_r(NULL, " ", &sp);
+        if (tok && strcmp(tok, TOKEN) == 0) {
+            s->authed = 1;
+            lg("[%s] authentication succeeded", s->peer_str);
+            R("OK AUTHENTICATED");
+        } else {
+            s->auth_fails++;
+            lg("[%s] authentication FAILED (%d/%d)", s->peer_str, s->auth_fails, MAX_AUTH_FAILS);
+            R("ERR 001 AUTH_FAILED");
+            if (s->auth_fails >= MAX_AUTH_FAILS) return 0;
+        }
+        return 1;
+    }
+    if (!s->authed) { R("ERR 003 NOT_AUTHENTICATED"); return 1; }
+
+    if (strcmp(cmd, "SYSINFO") == 0) {
+        char cpu[32]; long mem, up;
+        get_sysinfo(cpu, sizeof cpu, &mem, &up);
+        R("OK SYSINFO %s %ld %ld", cpu, mem, up);
+    } else if (strcmp(cmd, "LISTPROC") == 0) {
+        return do_listproc(s);
+    } else if (strcmp(cmd, "EXEC") == 0) {
+        char *a = strtok_r(NULL, " ", &sp);
+        char *b = strtok_r(NULL, " ", &sp);
+        return do_exec(s, a, b);
+    } else if (strcmp(cmd, "PUT") == 0) {
+        char *a = strtok_r(NULL, " ", &sp);
+        char *b = strtok_r(NULL, " ", &sp);
+        return do_put(s, a, b);
+    } else if (strcmp(cmd, "GET") == 0) {
+        return do_get(s, strtok_r(NULL, " ", &sp));
+    } else if (strcmp(cmd, "MONITOR") == 0) {
+        char *a = strtok_r(NULL, " ", &sp);
+        char *b = strtok_r(NULL, " ", &sp);
+        return do_monitor(s, a, b);
+    } else if (strcmp(cmd, "QUIT") == 0) {
+        stop_monitor(s);
+        reply(s, "OK BYE");
+        return 0;
+    } else {
+        R("ERR 006 UNKNOWN_COMMAND");
+    }
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-connection thread                                              */
+/* ------------------------------------------------------------------ */
+static void *session_thread(void *arg) {
+    Session *s = arg;
+    char line[LINE_MAX_LEN];
+    lg("[%s] CONNECTED (fd %d)", s->peer_str, s->fd);
+    for (;;) {
+        int r = read_line(s, line, sizeof line);
+        if (r == 0) { lg("[%s] client disconnected", s->peer_str); break; }
+        if (r == -1) { lg("[%s] connection error: %s (ungraceful disconnect)", s->peer_str, strerror(errno)); break; }
+        if (r == -2) { reply(s, "ERR 007 BAD_REQUEST"); lg("[%s] line too long, closing", s->peer_str); break; }
+        if (!handle_command(s, line)) break;
+    }
+    stop_monitor(s);               /* never leave a UDP stream running */
+    close(s->fd);
+    lg("[%s] DISCONNECTED", s->peer_str);
+    free(s);
+    return NULL;
+}
+
+int main(void) {
+    signal(SIGPIPE, SIG_IGN);
+    mkdir("./agentfiles", 0755);
+    mkdir(STORE_DIR, 0755);
+    logfp = fopen(LOGFILE, "a");
+    if (!logfp) { perror("fopen log"); return 1; }
+
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (ls < 0) { perror("socket"); return 1; }
+    int one = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(PORT);
+    if (bind(ls, (struct sockaddr *)&addr, sizeof addr) < 0) { perror("bind"); return 1; }
+    if (listen(ls, 16) < 0) { perror("listen"); return 1; }
+    lg("RemoteOps Agent started for %s: listening on TCP port %d (SID:%s)", REGNO, PORT, SID);
+
+    for (;;) {
+        Session *s = calloc(1, sizeof *s);
+        if (!s) continue;
+        socklen_t pl = sizeof s->peer;
+        s->fd = accept(ls, (struct sockaddr *)&s->peer, &pl);
+        if (s->fd < 0) { free(s); if (errno == EINTR) continue; perror("accept"); continue; }
+        setsockopt(s->fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &s->peer.sin_addr, ip, sizeof ip);
+        snprintf(s->peer_str, sizeof s->peer_str, "%s:%d", ip, ntohs(s->peer.sin_port));
+        atomic_init(&s->mon_stop, 0);
+        pthread_t t;
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&t, &at, session_thread, s) != 0) {
+            lg("pthread_create failed for %s", s->peer_str);
+            close(s->fd);
+            free(s);
+        }
+        pthread_attr_destroy(&at);
+    }
+}

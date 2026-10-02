@@ -1,0 +1,265 @@
+/*
+ * RemoteOps Controller (client) - IE3090 Network Programming
+ * Registration number : @@REGNO@@   (Agent port @@PORT@@, SID @@SID@@)
+ *
+ * Usage: ./controller_@@L3@@ [host] [port] [noauth]
+ *   Reads commands from stdin (interactive or piped). Raw protocol commands
+ *   are sent as typed. Special client-side forms:
+ *     PUT <localpath> [remotename]   upload a local file
+ *     GET <remotename> [localpath]   download (default: downloaded_<remotename>)
+ *     MONITOR START <udpport>        binds a local UDP socket and prints datagrams
+ *     MONITOR STOP
+ *   By default the controller authenticates automatically with the token.
+ */
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+#define DEFAULT_PORT @@PORT@@
+#define TOKEN        "@@TOKEN@@"
+#define BUF_SZ       4096
+#define LINE_MAX_LEN 70000
+
+typedef struct { int fd; char buf[BUF_SZ]; size_t len; } Conn;
+
+static int udp_fd = -1;
+static pthread_t udp_thr;
+static atomic_int udp_stop;
+static int udp_active = 0;
+
+static int send_all(int fd, const char *d, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = send(fd, d + off, n - off, MSG_NOSIGNAL);
+        if (w < 0) { if (errno == EINTR) continue; return -1; }
+        off += (size_t)w;
+    }
+    return 0;
+}
+
+static int send_line(Conn *c, const char *line) {
+    char out[2048];
+    int n = snprintf(out, sizeof out, "%s\n", line);
+    return send_all(c->fd, out, (size_t)n);
+}
+
+/* 1 = line, 0 = closed, -1 = error/too long */
+static int read_line(Conn *c, char *line, size_t cap) {
+    for (;;) {
+        char *nl = memchr(c->buf, '\n', c->len);
+        if (nl) {
+            size_t n = (size_t)(nl - c->buf);
+            if (n >= cap) return -1;
+            memcpy(line, c->buf, n);
+            line[n] = '\0';
+            size_t used = n + 1;
+            memmove(c->buf, c->buf + used, c->len - used);
+            c->len -= used;
+            return 1;
+        }
+        if (c->len >= BUF_SZ) {            /* long line: keep only what fits (rare) */
+            return -1;
+        }
+        ssize_t r = recv(c->fd, c->buf + c->len, BUF_SZ - c->len, 0);
+        if (r == 0) return 0;
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        c->len += (size_t)r;
+    }
+}
+
+static ssize_t read_chunk(Conn *c, char *dst, size_t max) {
+    if (c->len > 0) {
+        size_t n = c->len < max ? c->len : max;
+        memcpy(dst, c->buf, n);
+        memmove(c->buf, c->buf + n, c->len - n);
+        c->len -= n;
+        return (ssize_t)n;
+    }
+    for (;;) {
+        ssize_t r = recv(c->fd, dst, max, 0);
+        if (r < 0 && errno == EINTR) continue;
+        return r;
+    }
+}
+
+static double now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* ---- UDP monitor listener ---- */
+static void *udp_thread(void *arg) {
+    (void)arg;
+    char msg[512];
+    while (!atomic_load(&udp_stop)) {
+        ssize_t n = recvfrom(udp_fd, msg, sizeof msg - 1, 0, NULL, NULL);
+        if (n > 0) { msg[n] = '\0'; printf("[UDP] %s\n", msg); fflush(stdout); }
+    }
+    return NULL;
+}
+
+static int start_udp(int port) {
+    udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_fd < 0) return -1;
+    int one = 1;
+    setsockopt(udp_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct timeval tv = {0, 500000};
+    setsockopt(udp_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    a.sin_port = htons((uint16_t)port);
+    if (bind(udp_fd, (struct sockaddr *)&a, sizeof a) < 0) { close(udp_fd); udp_fd = -1; return -1; }
+    atomic_store(&udp_stop, 0);
+    pthread_create(&udp_thr, NULL, udp_thread, NULL);
+    udp_active = 1;
+    return 0;
+}
+
+static void stop_udp(void) {
+    if (!udp_active) return;
+    atomic_store(&udp_stop, 1);
+    pthread_join(udp_thr, NULL);
+    close(udp_fd);
+    udp_fd = -1;
+    udp_active = 0;
+}
+
+/* Read one response line and print it. Returns 1 ok, 0 on connection loss. */
+static int get_response(Conn *c, char *resp, size_t cap) {
+    int r = read_line(c, resp, cap);
+    if (r <= 0) { printf("Connection closed by Agent.\n"); return 0; }
+    printf("%s\n", resp);
+    return 1;
+}
+
+static int do_put(Conn *c, char *args) {
+    char *path = strtok(args, " ");
+    char *remote = strtok(NULL, " ");
+    if (!path) { printf("usage: PUT <localpath> [remotename]\n"); return 1; }
+    FILE *f = fopen(path, "rb");
+    struct stat st;
+    if (!f || fstat(fileno(f), &st) != 0) { printf("cannot open %s\n", path); if (f) fclose(f); return 1; }
+    if (!remote) { remote = strrchr(path, '/'); remote = remote ? remote + 1 : path; }
+    char hdr[512];
+    snprintf(hdr, sizeof hdr, "PUT %s %lld", remote, (long long)st.st_size);
+    double t0 = now_sec();
+    if (send_line(c, hdr) < 0) { fclose(f); return 0; }
+    char chunk[8192];
+    size_t n;
+    while ((n = fread(chunk, 1, sizeof chunk, f)) > 0)
+        if (send_all(c->fd, chunk, n) < 0) { fclose(f); return 0; }
+    fclose(f);
+    char resp[LINE_MAX_LEN];
+    if (!get_response(c, resp, sizeof resp)) return 0;
+    double dt = now_sec() - t0;
+    if (strncmp(resp, "OK", 2) == 0 && dt > 0)
+        printf("[throughput] PUT %lld bytes in %.3fs = %.0f bytes/s\n", (long long)st.st_size, dt, st.st_size / dt);
+    return 1;
+}
+
+static int do_get(Conn *c, char *args) {
+    char *remote = strtok(args, " ");
+    char *local = strtok(NULL, " ");
+    if (!remote) { printf("usage: GET <remotename> [localpath]\n"); return 1; }
+    char defpath[300];
+    if (!local) { snprintf(defpath, sizeof defpath, "downloaded_%s", remote); local = defpath; }
+    char cmd[300];
+    snprintf(cmd, sizeof cmd, "GET %s", remote);
+    double t0 = now_sec();
+    if (send_line(c, cmd) < 0) return 0;
+    char resp[LINE_MAX_LEN];
+    if (!get_response(c, resp, sizeof resp)) return 0;
+    char name[256];
+    long long size;
+    if (sscanf(resp, "OK FILE_SEND %255s %lld", name, &size) != 2) return 1;   /* error line */
+    FILE *f = fopen(local, "wb");
+    char chunk[8192];
+    long long remaining = size;
+    while (remaining > 0) {
+        size_t want = remaining > (long long)sizeof chunk ? sizeof chunk : (size_t)remaining;
+        ssize_t g = read_chunk(c, chunk, want);
+        if (g <= 0) { printf("connection lost during download\n"); if (f) fclose(f); return 0; }
+        if (f) fwrite(chunk, 1, (size_t)g, f);
+        remaining -= g;
+    }
+    if (f) fclose(f);
+    double dt = now_sec() - t0;
+    printf("[saved] %s (%lld bytes)\n", local, size);
+    if (dt > 0) printf("[throughput] GET %lld bytes in %.3fs = %.0f bytes/s\n", size, dt, size / dt);
+    return 1;
+}
+
+int main(int argc, char **argv) {
+    const char *host = argc > 1 ? argv[1] : "127.0.0.1";
+    int port = argc > 2 ? atoi(argv[2]) : DEFAULT_PORT;
+    int auto_auth = !(argc > 3 && strcmp(argv[3], "noauth") == 0);
+
+    struct addrinfo hints = {0}, *res;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char ps[16];
+    snprintf(ps, sizeof ps, "%d", port);
+    if (getaddrinfo(host, ps, &hints, &res) != 0) { fprintf(stderr, "cannot resolve %s\n", host); return 1; }
+    Conn *c = calloc(1, sizeof *c);
+    c->fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (c->fd < 0 || connect(c->fd, res->ai_addr, res->ai_addrlen) < 0) { perror("connect"); return 1; }
+    freeaddrinfo(res);
+    printf("Connected to %s:%d\n", host, port);
+
+    char *resp = malloc(LINE_MAX_LEN);
+    if (auto_auth) {
+        char a[128];
+        snprintf(a, sizeof a, "AUTH %s", TOKEN);
+        printf("> %s\n", a);
+        send_line(c, a);
+        if (!get_response(c, resp, LINE_MAX_LEN)) return 1;
+    }
+    int tty = isatty(STDIN_FILENO);
+    char *line = malloc(1024);
+    for (;;) {
+        if (tty) { printf("remoteops> "); fflush(stdout); }
+        if (!fgets(line, 1024, stdin)) { strcpy(line, "QUIT\n"); }
+        line[strcspn(line, "\r\n")] = '\0';
+        if (!line[0]) continue;
+        if (!tty) printf("> %s\n", line);
+
+        int alive = 1, quit = 0;
+        if (strncmp(line, "PUT ", 4) == 0) {
+            alive = do_put(c, line + 4);
+        } else if (strncmp(line, "GET ", 4) == 0) {
+            alive = do_get(c, line + 4);
+        } else if (strncmp(line, "MONITOR START ", 14) == 0) {
+            int up = atoi(line + 14);
+            if (udp_active) printf("local monitor already running\n");
+            else if (start_udp(up) < 0) { printf("cannot bind UDP port %d\n", up); continue; }
+            send_line(c, line);
+            alive = get_response(c, resp, LINE_MAX_LEN);
+            if (alive && strncmp(resp, "OK", 2) != 0) stop_udp();
+        } else if (strcmp(line, "MONITOR STOP") == 0) {
+            send_line(c, line);
+            alive = get_response(c, resp, LINE_MAX_LEN);
+            if (alive && strncmp(resp, "OK", 2) == 0) stop_udp();
+        } else {
+            quit = strcmp(line, "QUIT") == 0;
+            if (send_line(c, line) < 0) alive = 0;
+            else alive = get_response(c, resp, LINE_MAX_LEN);
+        }
+        if (!alive || quit) break;
+    }
+    stop_udp();
+    close(c->fd);
+    return 0;
+}

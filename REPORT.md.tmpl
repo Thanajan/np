@@ -1,0 +1,81 @@
+# IE3090 — RemoteOps Implementation Report  (DRAFT — convert to PDF/Word)
+
+> Replace every `[SCREENSHOT: ...]` with a screenshot of YOUR OWN program running (run `./test.sh`
+> and the manual commands below). Fabricated/edited screenshots are an academic-integrity breach.
+> Read each section and edit it so it is in your own words — you will be questioned on it in the viva.
+
+## 1. Personalised values
+Registration number: **@@REGNO@@** (numeric part @@NUM@@)
+
+| Item | Calculation | Value |
+|---|---|---|
+| Port | 7000 + @@FIRST4@@ | @@PORT@@ |
+| Source files | last 3 digits @@L3@@ | agent_@@L3@@.c, controller_@@L3@@.c, Makefile_@@L3@@ |
+| SID | @@LAST4@@ reversed | SID:@@SID@@ |
+| Token | OPS- + @@LAST4@@ | @@TOKEN@@ |
+| Log file | | @@LOGFILE@@ |
+| Storage path | | ./agentfiles/@@REGNO@@/<filename> |
+
+## 2. Architecture and concurrency model
+Two programs: Agent (TCP server on port @@PORT@@) and Controller (client). TCP carries the line-based
+control protocol and the raw PUT/GET bytes; UDP carries periodic monitoring datagrams from the Agent to a
+port opened by the Controller.
+Concurrency: **thread-per-connection** (pthreads, detached). Justification: each session has independent
+state (auth, buffer, monitor stream) so blocking I/O in a dedicated thread keeps the code simple and
+isolates slow clients (e.g. a long upload) from others. Alternatives considered: fork() (heavier, needs
+shared log), select/poll/epoll (scales better but needs explicit per-connection state machines for
+PUT/GET). Thread count is not a concern for the required ≥5 clients.
+`[DIAGRAM: draw Controller ⇄ Agent (accept loop → session thread → monitor thread) → UDP back to Controller]`
+
+## 3. Protocol implementation evidence
+Each command in §2.3 is implemented: AUTH, SYSINFO, LISTPROC, EXEC, PUT, GET, MONITOR START/STOP, QUIT.
+`[SCREENSHOT: full request/response exchange showing SID:@@SID@@ on every line]`
+
+## 4. Personalisation proof
+* `[SCREENSHOT: ss -tlnp | grep @@PORT@@]`
+* `[SCREENSHOT: head of @@LOGFILE@@]`
+* `[SCREENSHOT: ls -l ./agentfiles/@@REGNO@@/ showing an uploaded file]`
+
+## 5. Annotated code screenshots (crop tightly, readable font)
+For each, add 2–3 sentences explaining it in your own words.
+1. `[SCREENSHOT]` accept loop + pthread_create (connection handling & concurrency) — `main()`
+2. `[SCREENSHOT]` `read_line()` / `read_chunk()` (framing, partial reads, buffered body bytes)
+3. `[SCREENSHOT]` AUTH + not-authenticated gate in `handle_command()`
+4. `[SCREENSHOT]` `get_sysinfo()` and SYSINFO handler
+5. `[SCREENSHOT]` `do_listproc()`
+6. `[SCREENSHOT]` `do_exec()` whitelist
+7. `[SCREENSHOT]` `do_put()` (exact byte count, temp file + rename, resync on errors)
+8. `[SCREENSHOT]` `do_get()`
+9. `[SCREENSHOT]` `monitor_thread()` / `do_monitor()` / `stop_monitor()` (UDP loop; interval = 2 s)
+
+## 6. Execution / output screenshots
+`[SCREENSHOT]` Agent start-up · successful AUTH · SYSINFO / LISTPROC / EXEC · PUT and GET (with throughput) ·
+UDP stream arriving at the Controller · bad token (ERR 001) · disallowed EXEC (ERR 002) · 6 simultaneous controllers.
+
+## 7. Testing summary
+| # | Test | Expected | Actual |
+|---|---|---|---|
+| 1 | Command before AUTH | ERR 003 NOT_AUTHENTICATED | (fill from your run) |
+| 2 | AUTH wrong token | ERR 001 AUTH_FAILED (closed after 3) | |
+| 3 | AUTH correct | OK AUTHENTICATED SID:@@SID@@ | |
+| 4 | SYSINFO | cpu / mem MB / uptime s | |
+| 5 | LISTPROC | pid:name list | |
+| 6 | EXEC DATE/UPTIME/DISKFREE/HOSTNAME/WHOAMI | OK EXEC_RESULT | |
+| 7 | EXEC rm | ERR 002 COMMAND_NOT_ALLOWED | |
+| 8 | PUT 300 kB binary then GET | identical (cmp) | |
+| 9 | PUT 11 MB | ERR 004 FILE_TOO_LARGE, session stays in sync | |
+| 10 | GET missing | ERR 005 FILE_NOT_FOUND | |
+| 11 | PUT ../evil | ERR 008 BAD_FILENAME | |
+| 12 | MONITOR START/STOP | datagrams every 2 s then stop | |
+| 13 | 6 concurrent controllers | all served | |
+| 14 | Client killed mid-upload | agent alive, partial file removed, logged | |
+
+## 8. Design rationale and assumptions
+* Update interval for UDP stream: 2 s. Max file size 10 MB. Filenames limited to `[A-Za-z0-9._-]` so a client cannot escape the storage directory.
+* SYSINFO values read from /proc (loadavg 1-min as `cpu_load`, MemTotal−MemAvailable as `mem_used_mb`, /proc/uptime).
+* Responses must be one line, so EXEC output has newlines replaced by spaces.
+* After 3 failed AUTH attempts the Agent closes the connection (assumption — not in the brief).
+* Oversized uploads are drained (up to 64 MB) so the TCP stream stays framed correctly; larger claims close the connection.
+* Uploads are written to a temp file and renamed so GET never serves a half-written file.
+* Concurrent uploads of the same filename: last rename wins (documented limitation).
+* Optional extension implemented: throughput (bytes/s) for PUT and GET in the Controller.
